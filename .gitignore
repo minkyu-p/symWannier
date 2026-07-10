@@ -1,5 +1,9 @@
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
+
+# Local backup files
+src/symwannier/wannierize_orig.py
 
 # Local benchmark artifacts
 benchmarks/src_head/
@@ -11,3 +15,11 @@ benchmarks/**/stderr.*
 benchmarks/**/time.*
 benchmarks/**/*_py_hr.dat
 benchmarks/**/*_py_tb.dat
+
+# Local benchmark input links/copies
+benchmarks/**/wannier.iamn
+benchmarks/**/wannier.ieig
+benchmarks/**/wannier.immn
+benchmarks/**/wannier.isym
+benchmarks/**/wannier.nnkp
+benchmarks/**/wannier.win
