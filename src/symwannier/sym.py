@@ -18,6 +18,20 @@ class Sym:
         self.uspin_T = np.array([ [0, 1], [-1, 0] ])  # -i sigma_y
         self.uspin_T_inv = np.array([ [0, -1], [1, 0] ])  # (-i sigma_y)^-1
 
+    @staticmethod
+    def _periodic_kpoint_key(k, decimals=6):
+        """
+        Return a hashable key for k-points modulo reciprocal lattice vectors.
+        """
+        kmod = np.mod(np.asarray(k, dtype=float), 1.0)
+        kmod[np.isclose(kmod, 1.0, atol=10**(-decimals))] = 0.0
+        kmod[np.isclose(kmod, 0.0, atol=10**(-decimals))] = 0.0
+        return tuple(np.round(kmod, decimals))
+
+    @classmethod
+    def _build_kpoint_index(cls, kpoints):
+        return {cls._periodic_kpoint_key(k): ik for ik, k in enumerate(kpoints)}
+
     def _read_sym_file(self, file_sym):
         print("  Reading {}".format(file_sym))
         with open(file_sym) as fp:
@@ -110,31 +124,28 @@ class Sym:
         # full mesh
         full_klist = nnkp.kpoints
         nkf = len(full_klist)
+        full_kpoint_index = self._build_kpoint_index(full_klist)
         equiv = - np.ones( [ nkf ], dtype=int )
         equiv_sym = np.zeros( [ nkf ], dtype=int )
         iks2ik = - np.ones([ len(self.irr_kpoints) ], dtype=int )
-        for ik, k in enumerate(full_klist):
-            for iks, ks in enumerate(self.irr_kpoints):
-                kdiff = k - ks
-                if np.allclose(kdiff, np.round(kdiff)):
-                    iks2ik[iks] = ik
-                for isym, s in enumerate(self.s):
-                    sks = np.dot(s, ks)
-                    if self.t_rev[isym] == 1 : sks = -sks
-                    kdiff = sks - k
-                    if np.allclose(kdiff, np.round(kdiff)):
-                        if equiv[ik] < 0:
-                            equiv[ik] = iks
-                            equiv_sym[ik] = isym
-                            #if np.any(np.abs(kdiff) > 1e-5):
-                            #    print("Warning: first isym's kdiff /= 0")
-                            #    print(ks)
-                            #    print(np.dot(s, ks))
-                            #    print(k)
-                        elif equiv[ik] == iks:
-                            continue
-                        else:
-                            raise Exception("k corresponds to two different irr. kpoints")
+        for iks, ks in enumerate(self.irr_kpoints):
+            ik = full_kpoint_index.get(self._periodic_kpoint_key(ks))
+            if ik is not None:
+                iks2ik[iks] = ik
+
+            for isym, s in enumerate(self.s):
+                sks = np.dot(s, ks)
+                if self.t_rev[isym] == 1 : sks = -sks
+                ik = full_kpoint_index.get(self._periodic_kpoint_key(sks))
+                if ik is None:
+                    continue
+                if equiv[ik] < 0:
+                    equiv[ik] = iks
+                    equiv_sym[ik] = isym
+                elif equiv[ik] == iks:
+                    continue
+                else:
+                    raise Exception("k corresponds to two different irr. kpoints")
         if np.any(equiv < 0):
             raise Exception("some k points do not correspond to irr. kpoints")
         if np.any(iks2ik < 0):
@@ -147,6 +158,7 @@ class Sym:
         self.equiv = equiv
         self.equiv_sym = equiv_sym
         self.iks2ik = iks2ik
+        self._full_kpoint_index = full_kpoint_index
 
         #for ik, k in enumerate(self.full_kpoints):
         #    print("ik: {},  equiv[ik]: {},  k= {} {} {}".format(ik, equiv[ik], k[0], k[1], k[2]))
@@ -198,6 +210,9 @@ class Sym:
         """
         return ik such that full_kpoints[ik] = k
         """
+        ik = self._full_kpoint_index.get(self._periodic_kpoint_key(k))
+        if ik is not None:
+            return ik
         for ik, kf in enumerate(self.full_kpoints):
             kdiff = kf - k
             if np.allclose(kdiff, np.round(kdiff), atol=1e-5):
@@ -301,4 +316,3 @@ class Sym:
                         continue
                     val = self.repmat[ik, isym, m, n]
                     print("{:5d} {:5d} {:5d} {:5d} {:12.6f} {:12.6f}".format(ik, isym, m, n, val.real, val.imag))
-

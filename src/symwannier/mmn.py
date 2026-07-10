@@ -4,6 +4,7 @@ import numpy as np
 import os
 import gzip
 import itertools
+import time
 
 from symwannier.nnkp import Nnkp
 from symwannier.sym import Sym
@@ -13,6 +14,7 @@ class Mmn:
         self.nnkp = nnkp
         self.sym = sym
 
+        time_read = time.time()
         if os.path.exists(file_mmn):
             with open(file_mmn) as fp:
                 self._read_mmn(fp)
@@ -21,8 +23,11 @@ class Mmn:
                 self._read_mmn(fp)
         else:
             raise Exception("failed to read mmn file: " + file_mmn)
+        print("  Mmn raw file read/parse: {:.2f}s".format(time.time() - time_read))
 
+        time_expand = time.time()
         self._mmn_full_klist()
+        print("  Mmn full-k expansion: {:.2f}s".format(time.time() - time_expand))
 
     def write_mmn(self, file_mmn):
         with open(file_mmn, "w") as fp:
@@ -63,13 +68,21 @@ class Mmn:
         self.mmn = np.zeros([self.nks, self.nb, self.num_bands, self.num_bands], dtype=complex)
         self.kpb_info = np.zeros([self.nks, self.nb, 5], dtype=int)
 
-        for ik, ib in itertools.product(range(self.nks), range(self.nb)):
-            d = [ int(x) for x in fp.readline().split() ]
-            assert ik == d[0]-1, "{} {}".format(ik, d[0])
-            self.kpb_info[ik,ib,:] = d
-            for m, n in itertools.product( range(self.num_bands), repeat=2 ):
-                dat = [ float(x) for x in fp.readline().split() ]
-                self.mmn[ik,ib,n,m] = dat[0] + 1j*dat[1]
+        block_size = 5 + 2 * self.num_bands * self.num_bands
+        expected_size = self.nks * self.nb * block_size
+        dat = np.fromstring(fp.read(), sep=" ")
+        if dat.size != expected_size:
+            raise ValueError(
+                "unexpected mmn data size: got {}, expected {}".format(dat.size, expected_size)
+            )
+        dat = dat.reshape(self.nks, self.nb, block_size)
+
+        self.kpb_info[:,:,:] = dat[:,:,:5].astype(int)
+        expected_ik = np.arange(1, self.nks + 1)[:,np.newaxis]
+        assert np.all(self.kpb_info[:,:,0] == expected_ik), "ik index mismatch in mmn file"
+
+        mmn_dat = dat[:,:,5:].reshape(self.nks, self.nb, self.num_bands, self.num_bands, 2)
+        self.mmn[:,:,:,:] = np.transpose(mmn_dat[:,:,:,:,0] + 1j*mmn_dat[:,:,:,:,1], axes=(0,1,3,2))
 
     def _mmn_full_klist(self):
         if self.sym is None:
@@ -93,7 +106,10 @@ class Mmn:
         else:
             mmn = np.zeros([self.nk, self.nb, self.num_bands, self.num_bands], dtype=complex)
 
+            time_bvec = time.perf_counter()
             bvec_equiv = self.sym.kpoint_equiv_info(self.nnkp.bvec_crys)
+            time_bvec = time.perf_counter() - time_bvec
+            symop_cache = {}
             for ikf, kf in enumerate(self.sym.full_kpoints):
                 # s[isym] . irr_k[iki] = full_k[ikf]
                 iki = self.sym.equiv[ikf]
@@ -108,7 +124,10 @@ class Mmn:
                     isym2 = self.sym.equiv_sym[ikbi]
                     isym3 = self.sym.equiv_sym[ikbf]
                     # g[isym2]^-1 g[isym1]^-1 g[isym3] = s[isym,:,:], ft[isym,:,:] + tdiff
-                    isym, factor, tdiff = self.sym.search_symop( [[isym2, -1], [isym1, -1], [isym3, 1]] )
+                    symop_key = (isym2, isym1, isym3)
+                    if symop_key not in symop_cache:
+                        symop_cache[symop_key] = self.sym.search_symop( [[isym2, -1], [isym1, -1], [isym3, 1]] )
+                    isym, factor, tdiff = symop_cache[symop_key]
 
                     ikbi_eq = self.sym.equiv[ ikbi ]
 
@@ -117,10 +136,11 @@ class Mmn:
                         print(ikbi_eq)
 
                     self.kb2k[ikf,ibf] = ikbf
+
                     if self.sym.t_rev[isym2] == 1:
-                        mmn[ikf,ibf,:,:] = np.einsum("mn,np->mp", self.mmn[iki,ibi,:,:], np.conj(self.sym.repmat[ikbi_eq,isym,:,:]), optimize=True) * factor
+                        mmn[ikf,ibf,:,:] = np.matmul(self.mmn[iki,ibi,:,:], np.conj(self.sym.repmat[ikbi_eq,isym,:,:])) * factor
                     else:
-                        mmn[ikf,ibf,:,:] = np.einsum("mn,np->mp", self.mmn[iki,ibi,:,:], self.sym.repmat[ikbi_eq,isym,:,:], optimize=True) * factor
+                        mmn[ikf,ibf,:,:] = np.matmul(self.mmn[iki,ibi,:,:], self.sym.repmat[ikbi_eq,isym,:,:]) * factor
                     if self.sym.t_rev[isym1] == 1:
                         mmn[ikf,ibf,:,:] = np.conj(mmn[ikf,ibf,:,:])
 
@@ -142,6 +162,7 @@ class Mmn:
                     mmn[ikf,ibf,:,:] *= phase
 
             self.mmn = mmn
+            print("  Mmn b-vector equivalence: {:.2f}s".format(time_bvec))
+            print("  Mmn symop cache size: {}".format(len(symop_cache)))
 
         assert np.all( self.kb2k[:,:] >= 0 )  # check all kb2k is defined
-

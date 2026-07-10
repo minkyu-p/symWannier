@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Local benchmark artifacts
+benchmarks/src_head/
+benchmarks/src_head.tar
+benchmarks/**/slurm-*.out
+benchmarks/**/slurm-*.err
+benchmarks/**/stdout.*
+benchmarks/**/stderr.*
+benchmarks/**/time.*
+benchmarks/**/*_py_hr.dat
+benchmarks/**/*_py_tb.dat

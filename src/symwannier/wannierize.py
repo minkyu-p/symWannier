@@ -72,6 +72,21 @@ class Wannierize:
         self.omega_thr = 1e-8    # threshold for wannierization
         self.womega_thr = 1e-10  # threshold for disentanglement
 
+        # --- profiling info ---
+        print("")
+        print("=== symWannier profiling info ===")
+        print(f"  nk           = {self.nk}")
+        print(f"  num_bands    = {self.num_bands}")
+        print(f"  num_wann     = {self.num_wann}")
+        print(f"  disentangle  = {self.disentangle}")
+        print(f"  lsym         = {self.lsym}")
+        print(f"  lsite_sym    = {self.lsite_sym}")
+        print(f"  num_iter     = {self.win.num_iter}")
+        print(f"  dis_num_iter = {getattr(self.win, 'dis_num_iter', 'N/A')}")
+        print("=================================")
+        print("")
+
+
     def run(self):
         """
         main subroutine
@@ -115,8 +130,9 @@ class Wannierize:
         print("! Final:    omega_tot = {:15.8f}    time: {:12.6f}".format(omega, self.time.get_time()))
 
     def post_process(self):
+        self.time.start_clock("post_process")
         if self.disentangle:
-            self.Umat = np.einsum("kmn,knp->kmp", self.Umat_opt, self.Umat, optimize=True)
+            self.Umat = np.matmul(self.Umat_opt, self.Umat)
 
         if self.lsite_sym:
             Umat_irk = self.Umat[self.sym.iks2ik[:]]
@@ -126,8 +142,11 @@ class Wannierize:
         self.mmn = self.update_Mmn_by_Umat(self.mmn0, self.Umat)
         self.calc_omega_detail(self.mmn)
         self.show_spreads()
-        self.write_hr()
-        self.write_tb()
+        self.calc_irvec()
+        ham_r, fac = self.calc_ham_r()
+        self.write_hr(ham_r=ham_r)
+        self.write_tb(ham_r=ham_r, fac=fac)
+        self.time.stop_clock("post_process")
         self.time.show_all()
 
     def show_spreads(self):
@@ -141,7 +160,22 @@ class Wannierize:
         """
         #for k in range(self.nk):
         #    assert np.allclose( np.matmul(Umat[:,:,k], np.transpose(np.conj(Umat[:,:,k]))), np.eye(self.num_bands) ), "Umat is not unitary for k = {}".format(k)
-        return np.einsum("klm, kblp, kbpn->kbmn", np.conj(Umat), mmn, Umat[self.kb2k[:,:],:,:], optimize=True) # Eq. (61)
+        self.time.start_clock("update_Mmn_by_Umat")
+        Udag = np.swapaxes(np.conj(Umat), 1, 2)[:,np.newaxis,:,:]
+        ret = np.matmul(np.matmul(Udag, mmn), Umat[self.kb2k[:,:],:,:]) # Eq. (61)
+        self.time.stop_clock("update_Mmn_by_Umat")
+        return ret
+
+    def update_Mmn_diag_by_Umat(self, mmn, Umat):
+        """
+        Return only the diagonal Mnn of U^k Mmn^(0) U^(k+b).
+        """
+        self.time.start_clock("update_Mmn_diag_by_Umat")
+        Udag = np.swapaxes(np.conj(Umat), 1, 2)[:,np.newaxis,:,:]
+        tmp = np.matmul(Udag, mmn)
+        ret = np.einsum("kbnp,kbpn->kbn", tmp, Umat[self.kb2k[:,:],:,:], optimize=True)
+        self.time.stop_clock("update_Mmn_diag_by_Umat")
+        return ret
 
     def init_Umat_and_Mmn(self):
         """
@@ -150,7 +184,10 @@ class Wannierize:
         """
         if self.disentangle:
             print("  init Umatrix and Mmn using Umatrix_opt")
+            # --- profiling: Umat after disentangle ---
+            self.time.start_clock("Umat_init_disentangle")
             self.Umat = self.amn.Umat(index_win=self.index_win, Umat_opt=self.Umat_opt)
+            self.time.stop_clock("Umat_init_disentangle")
             self.mmn1 = self.update_Mmn_by_Umat(self.mmn0, self.Umat_opt)
             self.mmn = self.update_Mmn_by_Umat(self.mmn1, self.Umat)
             self.calc_omega_detail(self.mmn)
@@ -158,7 +195,10 @@ class Wannierize:
         else:  # without disentangle
             print("  init Umatrix and Mmn")
             if hasattr(self, "amn"):
+                # --- profiling: Umat without disentangle ---
+                self.time.start_clock("Umat_init_plain")
                 self.Umat = self.amn.Umat()
+                self.time.stop_clock("Umat_init_plain")
                 self.mmn1 = self.mmn0
                 self.mmn = self.update_Mmn_by_Umat(self.mmn1, self.Umat)
 
@@ -174,25 +214,33 @@ class Wannierize:
         calculate Omega = sum <r^2> - <r>^2
         update self.r (<r>)
         """
-        #r = 1j/self.nk * np.einsum("b,ba,nnkb->na", self.wb, self.bvec, self.mmn, optimize=True)
-        #r -= 1j * np.einsum("b,ba->a", self.wb, self.bvec)
-        #print("r = ", r)
+        self.time.start_clock("calc_omega")
         mnn = np.einsum("kbnn->kbn", mmn, optimize=True)
+        omega = self.calc_omega_from_mnn(mnn, update_state=True)
+        self.time.stop_clock("calc_omega")
+        return omega
+
+    def calc_omega_from_mnn(self, mnn, update_state=False):
+        """
+        calculate Omega from diagonal Mnn only.
+        """
         imlnmnn = np.log(mnn).imag
         r = -1/self.nk * np.einsum("b,ba,kbn->na", self.wb, self.bvec, imlnmnn, optimize=True)
 
         r2a = np.sum(self.wb)*self.nk - np.einsum("b,kbn,kbn->n", self.wb, mnn, np.conj(mnn), optimize=True)
         r2b = np.einsum("b,kbn->n", self.wb, imlnmnn**2)
         r2 = 1/self.nk * (r2a + r2b).real
-        self.r = r
-        
-        self.spreads = r2 - np.sum(r[:,:].real**2, axis=1)
-        return np.sum(self.spreads)
+        spreads = r2 - np.sum(r[:,:].real**2, axis=1)
+        if update_state:
+            self.r = r
+            self.spreads = spreads
+        return np.sum(spreads)
 
     def calc_omega_detail(self, mmn):
         """
         calculate OmegaI, Omega_D, Omega_OD
         """
+        self.time.start_clock("calc_omega_detail")
         mmn2 = np.einsum("kbmn,kbmn->kb", mmn, np.conj(mmn), optimize=True).real
         OmegaI = np.einsum("b, kb->", self.wb, self.num_wann - mmn2, optimize=True)/self.nk
 
@@ -208,47 +256,80 @@ class Wannierize:
         print("  OmegaI  = {:15.10f}".format(OmegaI))
         print("  OmegaD  = {:15.10f}".format(OmegaD))
         print("  OmegaOD = {:15.10f}".format(OmegaOD))
+        self.time.stop_clock("calc_omega_detail")
 
     def calc_dw(self):
         """
         calculate G in R1_Eq.(52)
         """
+        self.time.start_clock("calc_dw")
         mnn = np.einsum("kbnn->kbn", self.mmn, optimize=True)
         imlnmnn = np.log(mnn).imag
         r = -1/self.nk * np.einsum("b,ba,kbn->na", self.wb, self.bvec, imlnmnn, optimize=True)
-        Rmn = np.einsum("kbmn,kbn->kbmn", self.mmn, np.conj(mnn), optimize=True)  # R1_Eq.(45)
         qn = imlnmnn + np.einsum("ba, na->bn", self.bvec, r, optimize=True)[np.newaxis,:,:] # R1_Eq.(47)
-        T = np.einsum("kbmn, kbn->kbmn", self.mmn, qn/mnn, optimize=True)  # R1_Eq.(48,51)
-
-        AR = (Rmn - np.conj(np.transpose(Rmn, axes=(0,1,3,2))))/2  # A[R] = (R-R^dagger)/2
-        ST = (T + np.conj(np.transpose(T, axes=(0,1,3,2))))/(2j)  # S[T] = (T+T^dagger)/2i
-        dw = 4/self.nk * np.einsum("b,kbmn->kmn", self.wb, AR - ST, optimize=True)  # R1_Eq.(52)
+        # R1 Eq. (52), with R + iT combined to avoid four full-size temporaries.
+        xmn = self.mmn * (np.conj(mnn) + 1j * qn / mnn)[:,:,np.newaxis,:]
+        xsum = np.einsum("b,kbmn->kmn", self.wb, xmn, optimize=True)
+        dw = 2/self.nk * (xsum - np.conj(np.swapaxes(xsum, 1, 2)))
+        self.time.stop_clock("calc_dw")
         return dw
 
     def calc_expdw(self, dw):
         """
         calculate exp(dW) by diagonalizing i*dW  (i*dW is hermite)
         """
+        # --- profiling: calc_expdw (per wannierization iteration) ---
+        self.time.start_clock("calc_expdw")
+
         expdw = np.zeros_like(dw)
         for k in range(self.nk):
             e, v = scipy.linalg.eigh(1j*dw[k,:,:])
             #idw = np.einsum("ab,b,cb->ac", v, e, np.conj(v), optimize=True)
             #assert np.allclose(idw, 1j*dw[:,:,k], atol=1e-5), np.sum(np.abs(idw - 1j*dw[:,:,k]))/np.sum(np.abs(idw))
             expdw[k,:,:] = np.einsum("ab,b,cb->ac", v, np.exp(-1j*e), np.conj(v), optimize=True)
+        self.time.stop_clock("calc_expdw")
         return expdw
+
+    def calc_expdw_eig(self, dw):
+        """
+        Diagonalize i*dW once so exp(c*dW) can be reused for multiple c values.
+        """
+        self.time.start_clock("calc_expdw")
+        eigvals = np.zeros([self.nk, self.num_wann], dtype=float)
+        eigvecs = np.zeros_like(dw)
+        for k in range(self.nk):
+            eigvals[k,:], eigvecs[k,:,:] = scipy.linalg.eigh(1j*dw[k,:,:])
+        self.time.stop_clock("calc_expdw")
+        return eigvals, eigvecs
+
+    def calc_expdw_from_eig(self, eigvals, eigvecs, scale):
+        """
+        Build exp(scale*dW) from the eigensystem of i*dW.
+        """
+        phase = np.exp(-1j * scale * eigvals)
+        return np.matmul(
+            eigvecs * phase[:,np.newaxis,:],
+            np.swapaxes(np.conj(eigvecs), 1, 2),
+        )
 
     def update_mmn(self, dw, omega):
         """
         calculate optimal alpha and update self.Umat (U^(k)) and self.mmn (Mmn)
         return omega
         """
-        Umat1 = np.einsum("kmn, knl->kml", self.Umat, self.calc_expdw(dw), optimize=True)  # R1_Eq.(60)
-        mmn1 = self.update_Mmn_by_Umat(self.mmn1, Umat1)
-        omega1 = self.calc_omega(mmn1)
+        eigvals, eigvecs = self.calc_expdw_eig(dw)
 
-        Umat2 = np.einsum("kmn, knl->kml", self.Umat, self.calc_expdw(dw/2), optimize=True)  # R1_Eq.(60)
-        mmn2 = self.update_Mmn_by_Umat(self.mmn1, Umat2)
-        omega2 = self.calc_omega(mmn2)
+        Umat1 = np.matmul(self.Umat, self.calc_expdw_from_eig(eigvals, eigvecs, 1.0))  # R1_Eq.(60)
+        mnn1 = self.update_Mmn_diag_by_Umat(self.mmn1, Umat1)
+        self.time.start_clock("calc_omega")
+        omega1 = self.calc_omega_from_mnn(mnn1)
+        self.time.stop_clock("calc_omega")
+
+        Umat2 = np.matmul(self.Umat, self.calc_expdw_from_eig(eigvals, eigvecs, 0.5))  # R1_Eq.(60)
+        mnn2 = self.update_Mmn_diag_by_Umat(self.mmn1, Umat2)
+        self.time.start_clock("calc_omega")
+        omega2 = self.calc_omega_from_mnn(mnn2)
+        self.time.stop_clock("calc_omega")
 
         # get optimum alpha from omega(alpha=0), omega(alpha=1/2)=omega2, omega(alpha=1)=omega1
         if 2*omega + 2*omega1 - 4*omega2 < 0:
@@ -259,7 +340,7 @@ class Wannierize:
             alpha = max(0.01, alpha)
         #print("{:10.5f} {:10.5f} {:10.5f} {:10.5f}".format(omega, omega2, omega1, alpha))
 
-        self.Umat = np.einsum("kmn, knl->kml", self.Umat, self.calc_expdw(alpha*dw), optimize=True)  # R1_Eq.(60)
+        self.Umat = np.matmul(self.Umat, self.calc_expdw_from_eig(eigvals, eigvecs, alpha))  # R1_Eq.(60)
         #if self.lsite_sym:
         #    self.Umat = self.amn.Umat_symmetrize(self.Umat, self.Umat_opt)
         self.mmn = self.update_Mmn_by_Umat(self.mmn1, self.Umat)
@@ -280,7 +361,11 @@ class Wannierize:
         calculate self.Umat_opt and update mmn0U from amn file
         """
         assert hasattr(self, "amn"), "file_amn is not specified"
+
+        # --- profiling: Umat from Amn in dis_project ---
+        self.time.start_clock("Umat_dis_project")
         self.Umat_opt = self.amn.Umat(index_win = self.index_win)  # Umat_opt[:num_bands, :num_wann, :nk]
+        self.time.stop_clock("Umat_dis_project")
 
         # dis_proj_froz in wannier90
         # wannier90 uses ortho-fix which is not implemented here
@@ -306,7 +391,9 @@ class Wannierize:
         """
         update mmn0U = mmn0[num_bands, num_win] x Umat_opt[num_win, num_wann]
         """
-        self.mmn0U = np.einsum("kbml, kbln->kbmn", self.mmn0, self.Umat_opt[self.kb2k[:,:],:,:], optimize=True) # Eq. (61)
+        self.time.start_clock("update_mmn0U")
+        self.mmn0U = np.matmul(self.mmn0, self.Umat_opt[self.kb2k[:,:],:,:]) # Eq. (61)
+        self.time.stop_clock("update_mmn0U")
 
     def init_zmatrix(self):
         """
@@ -315,6 +402,7 @@ class Wannierize:
                 = sum_{bl} wb <u^(0)_mk | u^(i)_lk+b > < u^(i)_lk+b | u^0_nk >
         mu : Mmn_k U^(i)_k+b = <u^(0)_mk | u^(i)_lk+b >
         """
+        self.time.start_clock("init_zmatrix")
         # mu = mmn0[num_bands, num_win] x Umat_opt[num_win, num_wann]
         # zmat = mu x mu^\dagger
         zmat_froz = np.zeros([self.nk, self.num_bands, self.num_bands], dtype=complex)
@@ -324,18 +412,29 @@ class Wannierize:
         #    zmat_froz[k, :self.ndimfroz[k], :self.ndimfroz[k]] = np.einsum("b, bml, bnl->mn", self.wb, mmn0U_froz, np.conj(mmn0U_froz), optimize=True)
         #    mmn0U_nfroz = np.compress(self.index_nfroz[k,:], self.mmn0U[k,:,:,:], axis=1)
         #    zmat_nfroz[k, :self.len_nfroz[k], :self.len_nfroz[k]] = np.einsum("b, bml, bnl->mn", self.wb, mmn0U_nfroz, np.conj(mmn0U_nfroz), optimize=True)
-        zmat = np.einsum("b, kbml, kbnl->kmn", self.wb, self.mmn0U, np.conj(self.mmn0U), optimize=True)
+        zmat = np.zeros([self.nk, self.num_bands, self.num_bands], dtype=complex)
+        for ib, weight in enumerate(self.wb):
+            mu = self.mmn0U[:,ib,:,:]
+            zmat += weight * np.matmul(mu, np.swapaxes(np.conj(mu), 1, 2))
         for k in range(self.nk):
             zmat_froz[k,:self.ndimfroz[k],:self.ndimfroz[k]] = zmat[k, self.index_froz[k,:], :][:, self.index_froz[k,:]]
             zmat_nfroz[k,:self.len_nfroz[k],:self.len_nfroz[k]] = zmat[k, self.index_nfroz[k,:], :][:, self.index_nfroz[k,:]]
 
+        self.time.stop_clock("init_zmatrix")
         return zmat_froz, zmat_nfroz
 
     def calc_womegaI(self):
-        mmn = np.einsum("kml,kbmn->kbln", np.conj(self.Umat_opt), self.mmn0U, optimize=True)
-        return self.num_wann * np.sum(self.wb) - np.einsum("b,kbmn,kbmn->", self.wb, mmn, np.conj(mmn), optimize=True).real/self.nk
+        self.time.start_clock("calc_womegaI")
+        Udag = np.swapaxes(np.conj(self.Umat_opt), 1, 2)[:,np.newaxis,:,:]
+        mmn = np.matmul(Udag, self.mmn0U)
+        womegaI = self.num_wann * np.sum(self.wb) - np.einsum("b,kbmn,kbmn->", self.wb, mmn, np.conj(mmn), optimize=True).real/self.nk
+        self.time.stop_clock("calc_womegaI")
+        return womegaI
 
     def dis_extract(self):
+        # --- profiling: entire disentanglement loop ---
+        self.time.start_clock("dis_extract")
+
         for i in range(self.win.dis_num_iter):
             zmat_froz, zmat_nfroz = self.init_zmatrix()
             if not i == 0:
@@ -344,9 +443,12 @@ class Wannierize:
 
             wkomegaI1 = self.num_wann * np.sum(self.wb) * np.ones([self.nk])
 
+            self.time.start_clock("dis_extract_trace")
             for k in range(self.nk):
                 wkomegaI1[k] -= np.trace(zmat_froz[k, :self.ndimfroz[k], :self.ndimfroz[k]]).real
+            self.time.stop_clock("dis_extract_trace")
 
+            self.time.start_clock("dis_extract_eigh")
             for k in range(self.nk):
                 # Here, we consider -Z because we need eigvals of Z in descending order
                 e, v = scipy.linalg.eigh(-zmat_nfroz[k, :self.len_nfroz[k], :self.len_nfroz[k]])
@@ -358,6 +460,7 @@ class Wannierize:
 
                 # check unitary
                 #assert np.allclose( np.matmul(np.transpose(np.conj(self.Umat_opt[:,:,k])), self.Umat_opt[:,:,k]), np.eye(self.num_wann) )
+            self.time.stop_clock("dis_extract_eigh")
             self.update_mmn0U()
             
             womegaI1 = np.sum(wkomegaI1)/self.nk
@@ -369,8 +472,10 @@ class Wannierize:
                 break
 
             zmat_nfroz_old = zmat_nfroz
+        self.time.stop_clock("dis_extract")
 
     def calc_irvec(self):
+        self.time.start_clock("calc_irvec")
         real_metric = np.einsum("ij,lj->il", self.nnkp.a, self.nnkp.a)
         mp_grid = self.win.mp_grid
         ilist = np.array(list(itertools.product( range(-2,3), repeat=3 )))
@@ -390,47 +495,74 @@ class Wannierize:
         self.ndegen = ndeg[ind]
         # check sum rule
         assert np.sum(1/self.ndegen) - np.prod(mp_grid) < 1e-8, "error in finding Wigner-Seitz points"
+        self.time.stop_clock("calc_irvec")
 
-    def write_hr(self):
-        self.calc_irvec()
-
-        ham_k = np.einsum("kni,kn,knj->kij", np.conj(self.Umat), self.eig.eig, self.Umat, optimize=True)
-        kr = np.einsum("ka,ra->kr", self.kpts, self.irvec, optimize=True)
-        ham_r = np.einsum("kij,kr->ijr", ham_k, np.exp(-2 * np.pi * 1j * kr), optimize=True)/self.nk
-
-        t = datetime.datetime.now()
-        with open(self.file_hr_dat, "w") as fp:
-            fp.write(" written {}\n".format(t.strftime('on %d%b%Y at %H:%M:%S')))
-            fp.write("{:12d}\n{:12d}\n".format(self.num_wann, len(self.ndegen)))
-            fp.write(textwrap.fill("".join(["{:5d}".format(x) for x in self.ndegen]), 75, drop_whitespace=False))
-            fp.write("\n")
-            for irpts in range(len(self.ndegen)):
-                for i, j in itertools.product( range(self.num_wann), repeat=2 ):
-                    line = "".join( "{:5d}".format(x) for x in self.irvec[irpts,:] )
-                    line += "{:5d}{:5d}".format(j+1, i+1)
-                    if self.prec:
-                        line += "{:20.15f}{:20.15f}".format(ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
-                    else:
-                        line += "{:12.6f}{:12.6f}".format(ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
-                    #line += "{:15.10f}{:15.10f}".format(ham_r[i,j,irpts].real, ham_r[i,j,irpts].imag)
-                    fp.write(line + "\n")
-
-    def write_tb(self):
-        self.calc_irvec()
-
+    def calc_ham_r(self):
+        self.time.start_clock("calc_ham_r")
         ham_k = np.einsum("kni,kn,knj->kij", np.conj(self.Umat), self.eig.eig, self.Umat, optimize=True)
         kr = np.einsum("ka,ra->kr", self.kpts, self.irvec, optimize=True)
         fac = np.exp(-2 * np.pi * 1j * kr)
         ham_r = np.einsum("kij,kr->ijr", ham_k, fac, optimize=True)/self.nk
+        self.time.stop_clock("calc_ham_r")
+        return ham_r, fac
 
+    def write_hr(self, ham_r=None):
+        self.time.start_clock("write_hr")
+
+        if ham_r is None:
+            self.calc_irvec()
+            ham_r, _ = self.calc_ham_r()
+
+        ir_prefix = ["".join("{:5d}".format(x) for x in ir) for ir in self.irvec]
+        pairs = list(itertools.product(range(self.num_wann), repeat=2))
+        pair_prefix = [
+            "{:5d}{:5d}".format(j+1, i+1)
+            for i, j in pairs
+        ]
+
+        t = datetime.datetime.now()
+        with open(self.file_hr_dat, "w", buffering=16*1024*1024) as fp:
+            fp.write(" written {}\n".format(t.strftime('on %d%b%Y at %H:%M:%S')))
+            fp.write("{:12d}\n{:12d}\n".format(self.num_wann, len(self.ndegen)))
+            fp.write(textwrap.fill("".join(["{:5d}".format(x) for x in self.ndegen]), 75, drop_whitespace=False))
+            fp.write("\n")
+            for irpts, r_prefix in enumerate(ir_prefix):
+                lines = []
+                for ipair, (i, j) in enumerate(pairs):
+                    line = r_prefix + pair_prefix[ipair]
+                    if self.prec:
+                        line += "%20.15f%20.15f" % (ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
+                    else:
+                        line += "%12.6f%12.6f" % (ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
+                    #line += "{:15.10f}{:15.10f}".format(ham_r[i,j,irpts].real, ham_r[i,j,irpts].imag)
+                    lines.append(line + "\n")
+                fp.writelines(lines)
+        self.time.stop_clock("write_hr")
+
+    def write_tb(self, ham_r=None, fac=None):
+        self.time.start_clock("write_tb")
+
+        if ham_r is None or fac is None:
+            self.calc_irvec()
+            ham_r, fac = self.calc_ham_r()
+
+        self.time.start_clock("write_tb_matrix")
         mnn = np.einsum("kbnn->kbn", self.mmn, optimize=True)
         imlnmnn = np.log(mnn).imag
         rk = - np.einsum("b,ba,kbn->ank", self.wb, self.bvec, imlnmnn, optimize=True)
         rr = np.einsum("ank,kr->anr", rk, fac, optimize=True)/self.nk
         rr2 = 1j * np.einsum("b,ba,kbmn,kr->amnr", self.wb, self.bvec, self.mmn, fac, optimize=True)/self.nk
+        self.time.stop_clock("write_tb_matrix")
+        ir_prefix = ["".join("{:5d}".format(x) for x in ir) for ir in self.irvec]
+        pairs = list(itertools.product(range(self.num_wann), repeat=2))
+        pair_prefix = [
+            "{:5d}{:5d}  ".format(j+1, i+1)
+            for i, j in pairs
+        ]
 
         t = datetime.datetime.now()
-        with open(self.file_tb_dat, "w") as fp:
+        self.time.start_clock("write_tb_file")
+        with open(self.file_tb_dat, "w", buffering=16*1024*1024) as fp:
             fp.write(" written {}\n".format(t.strftime('on %d%b%Y at %H:%M:%S')))
             fp.write(" {0[0]:15.8f} {0[1]:15.8f} {0[2]:15.8f}\n".format(self.nnkp.a[0,:]))
             fp.write(" {0[0]:15.8f} {0[1]:15.8f} {0[2]:15.8f}\n".format(self.nnkp.a[1,:]))
@@ -441,31 +573,38 @@ class Wannierize:
             #
             # write <0n|H|Rm>
             #
-            for irpts in range(len(self.ndegen)):
+            for irpts, r_prefix in enumerate(ir_prefix):
                 fp.write("\n")
-                fp.write("".join( "{:5d}".format(x) for x in self.irvec[irpts,:] ))
+                fp.write(r_prefix)
                 fp.write("\n")
-                for i, j in itertools.product( range(self.num_wann), repeat=2 ):
-                    line = "{:5d}{:5d}  ".format(j+1, i+1)
+                for ipair, (i, j) in enumerate(pairs):
+                    line = pair_prefix[ipair]
                     if self.prec:
-                        line += " {:22.15e} {:22.15e}".format(ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
+                        line += " %22.15e %22.15e" % (ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
                     else:
-                        line += " {:15.8e} {:15.8e}".format(ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
+                        line += " %15.8e %15.8e" % (ham_r[j,i,irpts].real, ham_r[j,i,irpts].imag)
                     fp.write(line + "\n")
             #
             # write <0n|r|Rm>
             #
-            for irpts in range(len(self.ndegen)):
+            for irpts, r_prefix in enumerate(ir_prefix):
                 fp.write("\n")
-                fp.write("".join( "{:5d}".format(x) for x in self.irvec[irpts,:] ))
+                fp.write(r_prefix)
                 fp.write("\n")
-                for i, j in itertools.product( range(self.num_wann), repeat=2 ):
-                    line = "{:5d}{:5d}  ".format(j+1, i+1)
+                for ipair, (i, j) in enumerate(pairs):
+                    line = pair_prefix[ipair]
                     if i == j:
-                        line += "".join([" {:15.8e} {:15.8e}".format(x.real, x.imag) for x in rr[:,i,irpts]])
+                        vals = rr[:,i,irpts]
                     else:
-                        line += "".join([" {:15.8e} {:15.8e}".format(x.real, x.imag) for x in rr2[:,j,i,irpts]])
+                        vals = rr2[:,j,i,irpts]
+                    line += " %15.8e %15.8e %15.8e %15.8e %15.8e %15.8e" % (
+                        vals[0].real, vals[0].imag,
+                        vals[1].real, vals[1].imag,
+                        vals[2].real, vals[2].imag,
+                    )
                     fp.write(line + "\n")
+        self.time.stop_clock("write_tb_file")
+        self.time.stop_clock("write_tb")
 
 
 def main(argv=None, for_cli=False):
